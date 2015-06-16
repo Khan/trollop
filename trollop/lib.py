@@ -2,7 +2,8 @@ from urllib import urlencode
 import json
 import isodate
 
-import requests
+# KA: swapped urlfetch in for requests in order to play nice w/ App Engine
+from google.appengine.api import urlfetch
 
 
 def get_class(str_or_class):
@@ -17,8 +18,6 @@ def get_class(str_or_class):
 class TrelloConnection(object):
 
     def __init__(self, api_key, oauth_token):
-        self.session = requests.session()
-
         self.key = api_key
         self.token = oauth_token
 
@@ -32,24 +31,14 @@ class TrelloConnection(object):
         params.update({'key': self.key, 'token': self.token})
         url += '?' + urlencode(params)
 
-        # Trello recently got picky about headers.  Only set content type if
-        # we're submitting a payload in the body
-        namedFile = None
-        if body:
-          headers = {'Content-Type': 'application/json'}
-          if method == 'POST':
-            if filename:
-              namedFile = (filename,body)
-            elif hasattr(body, 'name'):
-              namedFile = (body.name, body)
-        else:
-          headers = None
-        if namedFile:
-          response = requests.post(url, files=dict(file=namedFile))
-        else:
-          response = self.session.request(method, url, data=body, headers=headers)
-        response.raise_for_status()
-        return response.text
+        # KA: doesn't currently support file uploads. This was removed when we
+        # swapped urlfetch in for requests, and we'll add it back in if/when
+        # we need it.
+        response = urlfetch.fetch(url=url, method=method)
+        if response.status_code != 200:
+            raise Exception("Error: (%s) \"%s\"" %
+                    (response.status_code, response.content))
+        return response.content
 
     def get(self, path, params=None):
         return self.request('GET', path, params)
@@ -84,6 +73,9 @@ class TrelloConnection(object):
     def get_organization(self, org_id):
         return Organization(self, org_id)
 
+    def get_token(self, token):
+        return Token(self, token)
+
     @property
     def me(self):
         """
@@ -110,6 +102,19 @@ class Deletable(object):
     def delete(self):
         path = self._prefix + self._id
         self._conn.delete(path)
+
+
+class WebHookable(object):
+    """
+    Mixin for Trello objects which can have webhooks attached to 'em.
+    """
+    def add_webhook(self, callbackURL):
+        """Attach a webhook to this object which hits callbackURL on events."""
+        path = WebHook._prefix
+        params = {'idModel': self._id, 'callbackURL': callbackURL}
+        data = json.loads(self._conn.post(path, params=params))
+        webhook = WebHook(self._conn, data['id'], data)
+        return webhook
 
 
 class Labeled(object):
@@ -220,12 +225,18 @@ class SubList(object):
         self._lists = {}
 
     def __get__(self, instance, owner):
-        if not instance._id in self._lists:
+        # KA: trollop's SubList does some dangerous caching on the SubList
+        # class. This can result in stale data reads. We're working around the
+        # bug and not trying to refactor trollop's code by making the cache key
+        # use both the Trello object's instance id and the python object's
+        # identity according to id().
+        list_id = "%s:%s" % (instance._id, id(instance))
+        if not list_id in self._lists:
             cls = get_class(self.cls)
             path = instance._prefix + instance._id + cls._prefix
             data = json.loads(instance._conn.get(path))
-            self._lists[instance._id] = [cls(instance._conn, d['id'], d) for d in data]
-        return self._lists[instance._id]
+            self._lists[list_id] = [cls(instance._conn, d['id'], d) for d in data]
+        return self._lists[list_id]
 
 
 class TrelloMeta(type):
@@ -307,7 +318,7 @@ class Action(LazyTrello):
     creator = ObjectField('idMemberCreator', 'Member')
 
 
-class Board(LazyTrello, Closable):
+class Board(LazyTrello, Closable, WebHookable):
 
     _prefix = '/boards/'
 
@@ -453,6 +464,22 @@ class Sticker(LazyTrello):
     _prefix = '/stickers/'
 
     image = Field()
+    imageUrl = Field()
+
+
+class CustomSticker(LazyTrello):
+    _prefix = '/customStickers/'
+
+    url = Field()
+
+
+class WebHook(LazyTrello, Deletable):
+    _prefix = '/webhooks/'
+
+    active = BoolField()
+    callbackURL = Field()
+    description = Field()
+    idModel = Field()
 
 
 class Attachment(LazyTrello):
@@ -481,6 +508,14 @@ class Member(LazyTrello):
     cards = SubList('Card')
     notifications = SubList('Notification')
     organizations = SubList('Organization')
+    customStickers = SubList('CustomSticker')
+
+
+class Token(LazyTrello):
+
+    _prefix = '/tokens/'
+
+    webhooks = SubList('WebHook')
 
 
 class Notification(LazyTrello):
