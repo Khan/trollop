@@ -358,6 +358,11 @@ class Card(LazyTrello, Closable, Deletable, Labeled):
     checklists = ListField('idChecklists','Checklist')
     members = ListField('idMembers', 'Member')
 
+    def update_desc(self, new_desc):
+        self._conn.request('PUT', self._path, params={
+            'desc': new_desc
+        })
+
     def detach(self, attachment):
         """
         Remove attachment from card
